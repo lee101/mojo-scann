@@ -4,13 +4,11 @@ The Python layer owns arrays and training.  This unit only receives raw addresse
 which keeps the exported ABI concrete and makes scoring usable from ctypes.
 """
 
-from std.algorithm.functional import parallelize
 from std.sys.info import simd_width_of
 
-comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime W = simd_width_of[DType.float64]()
-comptime PARALLEL_SCORE_MIN = 65_536
 
 
 @export("msc_l2_scores")
@@ -23,15 +21,15 @@ def msc_l2_scores(data: Int, query: Int, dst: Int, n: Int, d: Int) abi("C"):
         var vector_total = SIMD[DType.float64, W](0)
         var col = 0
         while col + W <= d:
-            var delta = x.load[width=W](row * d + col) - q.load[width=W](col)
+            var delta = x.unsafe_load[width=W](row * d + col) - q.unsafe_load[width=W](col)
             vector_total += delta * delta
             col += W
         total = vector_total.reduce_add()
         while col < d:
-            var delta = x[row * d + col] - q[col]
+            var delta = x[unsafe_offset=row * d + col] - q[unsafe_offset=col]
             total += delta * delta
             col += 1
-        result[row] = total
+        result[unsafe_offset=row] = total
 
 
 @export("msc_dot_scores")
@@ -44,13 +42,13 @@ def msc_dot_scores(data: Int, query: Int, dst: Int, n: Int, d: Int) abi("C"):
         var vector_total = SIMD[DType.float64, W](0)
         var col = 0
         while col + W <= d:
-            vector_total += x.load[width=W](row * d + col) * q.load[width=W](col)
+            vector_total += x.unsafe_load[width=W](row * d + col) * q.unsafe_load[width=W](col)
             col += W
         total = vector_total.reduce_add()
         while col < d:
-            total += x[row * d + col] * q[col]
+            total += x[unsafe_offset=row * d + col] * q[unsafe_offset=col]
             col += 1
-        result[row] = total
+        result[unsafe_offset=row] = total
 
 
 @export("msc_l2_scores_batched")
@@ -64,20 +62,17 @@ def msc_l2_scores_batched(data: Int, queries: Int, dst: Int, n: Int, d: Int, m: 
             var vector_total = SIMD[DType.float64, W](0)
             var col = 0
             while col + W <= d:
-                var delta = x.load[width=W](row * d + col) - q.load[width=W](query_row * d + col)
+                var delta = x.unsafe_load[width=W](row * d + col) - q.unsafe_load[width=W](query_row * d + col)
                 vector_total += delta * delta
                 col += W
             total = vector_total.reduce_add()
             while col < d:
-                var delta = x[row * d + col] - q[query_row * d + col]
+                var delta = x[unsafe_offset=row * d + col] - q[unsafe_offset=query_row * d + col]
                 total += delta * delta
                 col += 1
-            result[query_row * n + row] = total
-    if n * m >= PARALLEL_SCORE_MIN:
-        parallelize[score_query](m, 16)
-    else:
-        for query_row in range(m):
-            score_query(query_row)
+            result[unsafe_offset=query_row * n + row] = total
+    for query_row in range(m):
+        score_query(query_row)
 
 
 @export("msc_dot_scores_batched")
@@ -91,18 +86,15 @@ def msc_dot_scores_batched(data: Int, queries: Int, dst: Int, n: Int, d: Int, m:
             var vector_total = SIMD[DType.float64, W](0)
             var col = 0
             while col + W <= d:
-                vector_total += x.load[width=W](row * d + col) * q.load[width=W](query_row * d + col)
+                vector_total += x.unsafe_load[width=W](row * d + col) * q.unsafe_load[width=W](query_row * d + col)
                 col += W
             total = vector_total.reduce_add()
             while col < d:
-                total += x[row * d + col] * q[query_row * d + col]
+                total += x[unsafe_offset=row * d + col] * q[unsafe_offset=query_row * d + col]
                 col += 1
-            result[query_row * n + row] = total
-    if n * m >= PARALLEL_SCORE_MIN:
-        parallelize[score_query](m, 16)
-    else:
-        for query_row in range(m):
-            score_query(query_row)
+            result[unsafe_offset=query_row * n + row] = total
+    for query_row in range(m):
+        score_query(query_row)
 
 
 @export("msc_ah_scores")
@@ -113,8 +105,8 @@ def msc_ah_scores(codes: Int, lookup: Int, dst: Int, n: Int, blocks: Int, centro
     for row in range(n):
         var total = 0.0
         for block in range(blocks):
-            total += table[block * centroids + Int(code[row * blocks + block])]
-        result[row] = total
+            total += table[unsafe_offset=block * centroids + Int(code[unsafe_offset=row * blocks + block])]
+        result[unsafe_offset=row] = total
 
 
 @export("msc_ah_scores_batched")
@@ -127,10 +119,7 @@ def msc_ah_scores_batched(codes: Int, lookups: Int, dst: Int, n: Int, blocks: In
         for row in range(n):
             var total = 0.0
             for block in range(blocks):
-                total += table[query_row * table_size + block * centroids + Int(code[row * blocks + block])]
-            result[query_row * n + row] = total
-    if n * m >= PARALLEL_SCORE_MIN:
-        parallelize[score_query](m, 16)
-    else:
-        for query_row in range(m):
-            score_query(query_row)
+                total += table[unsafe_offset=query_row * table_size + block * centroids + Int(code[unsafe_offset=row * blocks + block])]
+            result[unsafe_offset=query_row * n + row] = total
+    for query_row in range(m):
+        score_query(query_row)
