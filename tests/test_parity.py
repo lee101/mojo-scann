@@ -101,6 +101,21 @@ def test_batched_l2_handles_simd_tails_and_parallel_threshold(rows, queries):
         assert np.allclose(actual_distances, reference[expected], rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("rows, queries", [(257, 3), (2048, 40)])
+def test_fused_pq_rerank_handles_simd_tails_and_parallel_threshold(rows, queries):
+    rng = np.random.default_rng(2 * rows + queries)
+    data = np.ascontiguousarray(rng.normal(size=(rows, 7)))
+    query_array = np.ascontiguousarray(rng.normal(size=(queries, 7)))
+    searcher = (scann.builder(data, 4, "squared_l2")
+                .score_ah(3, min_cluster_size=64, training_iterations=4)
+                .reorder(32).build())
+    ids, distances = searcher.search_batched(query_array, 4)
+    expected = [searcher.search(query, 4) for query in query_array]
+    assert np.array_equal(ids, np.stack([pair[0] for pair in expected]))
+    assert np.allclose(distances, np.stack([pair[1] for pair in expected]),
+                       rtol=1e-6, atol=1e-6)
+
+
 def test_upstream_wheel_brute_force_parity(vectors):
     """Run installed upstream outside this checkout, avoiding our matching package name."""
     data, queries = vectors

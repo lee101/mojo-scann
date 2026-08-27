@@ -80,11 +80,17 @@ searches and includes query scoring plus reordering, not PQ training.
 
 | kernel | mojo-scann | upstream scann | ratio | result |
 | --- | ---: | ---: | ---: | --- |
-| PQ search + reorder (20k x 32, 100 queries) | 34.4 ms | 2.7 ms | 0.08x | slower |
+| PQ search + reorder (20k x 32, 100 queries) | 7.3 ms | 3.3 ms | 0.45x | slower |
 
-The CPU path uses SIMD reductions in the Mojo exact-score kernels and batches
-lookup scoring, shortlist selection, and reordering to avoid per-query ctypes
-overhead. This port is CPU-only.
+The CPU path uses SIMD reductions with scalar tails in the Mojo exact-score
+kernels, thresholded parallel query batches, and fused PQ scoring/shortlisting
+to avoid a full batched score matrix. PQ codes use one byte per block, and
+NumPy buffers remain zero-copy across each FFI call.
+
+This port is CPU-only. PQ lookup scoring is an indexed, memory-bound operation
+well below 2 flops per byte, and exact reranking is also below that arithmetic
+intensity, so a GPU path would add transfer and launch overhead without a
+credible speedup.
 
 ## Development
 

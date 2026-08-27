@@ -18,8 +18,10 @@ _SIGNATURES = {
     "msc_dot_scores": ([I, I, I, I, I], None),
     "msc_l2_scores_batched": ([I, I, I, I, I, I], None),
     "msc_dot_scores_batched": ([I, I, I, I, I, I], None),
+    "msc_exact_candidates_batched": ([I, I, I, I, I, I, I, I], None),
     "msc_ah_scores": ([I, I, I, I, I, I], None),
     "msc_ah_scores_batched": ([I, I, I, I, I, I, I], None),
+    "msc_ah_top_batched": ([I, I, I, I, I, I, I, I, I, I], None),
 }
 _loaded: ctypes.CDLL | None = None
 

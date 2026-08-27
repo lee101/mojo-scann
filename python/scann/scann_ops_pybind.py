@@ -7,12 +7,31 @@ this compact implementation does not need every one of them.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
 
 from . import _lib
+
+
+_PARALLEL_WORK_THRESHOLD = 65_536
+_PARALLEL_WORKERS = min(8, os.cpu_count() or 1)
+_POOL = ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS)
+
+
+def _run_batched(rows: int, width: int, fn) -> None:
+    if rows * width < _PARALLEL_WORK_THRESHOLD or rows == 1:
+        fn(0, rows)
+        return
+    workers = min(_PARALLEL_WORKERS, rows)
+    chunk = (rows + workers - 1) // workers
+    futures = [_POOL.submit(fn, start, min(rows, start + chunk))
+               for start in range(0, rows, chunk)]
+    for future in futures:
+        future.result()
 
 
 def _validate_data(dataset: object) -> np.ndarray:
@@ -89,6 +108,7 @@ def _top_batched(scores: np.ndarray, count: int, descending: bool) -> np.ndarray
 @dataclass
 class _PQ:
     centers: np.ndarray
+    center_norms: np.ndarray
     codes: np.ndarray
     width: int
 
@@ -148,7 +168,12 @@ class ScannSearcher:
             blocks = padded.reshape(len(queries), centers.shape[0], width)
         if self._descending:
             return np.einsum("bcd,mbd->mbc", centers, blocks, optimize=True).astype(np.float64)
-        return ((centers[None, :, :, :] - blocks[:, :, None, :]) ** 2).sum(axis=3)
+        dot = np.einsum("bcd,mbd->mbc", centers, blocks, optimize=True)
+        query_norms = np.einsum("mbd,mbd->mb", blocks, blocks, optimize=True)
+        dot *= -2.0
+        dot += self._pq.center_norms[None, :, :]
+        dot += query_norms[:, :, None]
+        return dot
 
     def _scores(self, query: np.ndarray) -> np.ndarray:
         scores = np.empty(self.size, dtype=np.float64)
@@ -167,13 +192,35 @@ class ScannSearcher:
         api = _lib.lib()
         if self._pq is None:
             fn = api.msc_dot_scores_batched if self._descending else api.msc_l2_scores_batched
-            fn(_lib.addr(self._data), _lib.addr(queries), _lib.addr(scores), self.size,
-               self._data.shape[1], len(queries))
+            def score_rows(start: int, stop: int) -> None:
+                fn(_lib.addr(self._data), _lib.addr(queries[start:stop]),
+                   _lib.addr(scores[start:stop]), self.size, self._data.shape[1], stop - start)
+            _run_batched(len(queries), self.size, score_rows)
         else:
             lookup = np.ascontiguousarray(self._lookup_batched(queries), dtype=np.float64)
-            api.msc_ah_scores_batched(_lib.addr(self._pq.codes), _lib.addr(lookup), _lib.addr(scores),
-                                      self.size, self._pq.codes.shape[1], lookup.shape[2], len(queries))
+            def score_rows(start: int, stop: int) -> None:
+                api.msc_ah_scores_batched(_lib.addr(self._pq.codes), _lib.addr(lookup[start:stop]),
+                                          _lib.addr(scores[start:stop]), self.size,
+                                          self._pq.codes.shape[1], lookup.shape[2], stop - start)
+            _run_batched(len(queries), self.size, score_rows)
         return scores
+
+    def _shortlist_batched(self, queries: np.ndarray, count: int) -> np.ndarray:
+        assert self._pq is not None
+        count = min(max(1, count), self.size)
+        lookup = np.ascontiguousarray(self._lookup_batched(queries), dtype=np.float64)
+        ids = np.empty((len(queries), count), dtype=np.int64)
+        scores = np.empty((len(queries), count), dtype=np.float64)
+        fn = _lib.lib().msc_ah_top_batched
+
+        def score_rows(start: int, stop: int) -> None:
+            fn(_lib.addr(self._pq.codes), _lib.addr(lookup[start:stop]),
+               _lib.addr(ids[start:stop]), _lib.addr(scores[start:stop]), self.size,
+               self._pq.codes.shape[1], lookup.shape[2], stop - start, count,
+               int(self._descending))
+
+        _run_batched(len(queries), self.size, score_rows)
+        return ids
 
     def _candidate_ids(self, query: np.ndarray, leaves_to_search: int) -> np.ndarray:
         if self._leaf_ids is None:
@@ -238,6 +285,24 @@ class ScannSearcher:
             ids = self._docids[ids]
         return ids.astype(np.int64, copy=False), scores.astype(np.float32)
 
+    def _rerank_batched(self, queries: np.ndarray, shortlist: np.ndarray,
+                        requested: int):
+        rows = np.arange(len(queries))[:, None]
+        exact = np.empty(shortlist.shape, dtype=np.float64)
+        fn = _lib.lib().msc_exact_candidates_batched
+
+        def score_rows(start: int, stop: int) -> None:
+            fn(_lib.addr(self._data), _lib.addr(queries[start:stop]),
+               _lib.addr(shortlist[start:stop]), _lib.addr(exact[start:stop]), stop - start,
+               shortlist.shape[1], self._data.shape[1], int(self._descending))
+
+        _run_batched(len(queries), shortlist.shape[1] * self._data.shape[1], score_rows)
+        local = _top_batched(exact, requested, self._descending)
+        ids, scores = shortlist[rows, local], exact[rows, local]
+        if self._docids is not None:
+            ids = self._docids[ids]
+        return ids.astype(np.int64, copy=False), scores.astype(np.float32)
+
     def search(self, query: object, final_num_neighbors: int = -1,
                pre_reorder_num_neighbors: int = -1, leaves_to_search: int = -1):
         """Return `(neighbors, distances)` with ScaNN's native argument names."""
@@ -257,6 +322,13 @@ class ScannSearcher:
         if self._distance == "cosine":
             norms = np.linalg.norm(query_array, axis=1, keepdims=True)
             query_array = query_array / np.where(norms == 0, 1.0, norms)
+        if self._leaf_ids is None and self._pq is not None and self._reorder > 0:
+            requested = final_num_neighbors if final_num_neighbors > 0 else self._num_neighbors
+            budget = (pre_reorder_num_neighbors if pre_reorder_num_neighbors > 0
+                      else self._reorder)
+            budget = max(requested, budget) if budget else requested
+            shortlist = self._shortlist_batched(query_array, budget)
+            return self._rerank_batched(query_array, shortlist, requested)
         approximate = self._scores_batched(query_array)
         if self._leaf_ids is None:
             return self._finish_searches_batched(query_array, approximate, final_num_neighbors,
@@ -330,12 +402,13 @@ class ScannBuilder:
             padded = np.pad(data, ((0, 0), (0, blocks * width - data.shape[1])))
             cluster_count = min(256, max(2, len(data) // min_cluster_size))
             centers = np.empty((blocks, cluster_count, width), dtype=np.float64)
-            codes = np.empty((len(data), blocks), dtype=np.int64)
+            codes = np.empty((len(data), blocks), dtype=np.uint8)
             for block in range(blocks):
                 section = padded[:, block * width:(block + 1) * width]
                 centers[block] = _kmeans(section, cluster_count, iterations, block)
                 codes[:, block] = _nearest(section, centers[block])
-            pq = _PQ(centers, np.ascontiguousarray(codes), width)
+            center_norms = np.einsum("bcd,bcd->bc", centers, centers, optimize=True)
+            pq = _PQ(centers, np.ascontiguousarray(center_norms), np.ascontiguousarray(codes), width)
         leaf_ids = leaf_centers = None
         default_leaves = None
         if self._tree_args is not None:
